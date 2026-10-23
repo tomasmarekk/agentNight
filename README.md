@@ -1,4 +1,4 @@
-# agentNight
+![agentNight](docs/agentnight-img.png)
 
 [![CI](https://repo-badges.46.224.229.218.sslip.io/github/ci/tomasmarekk/agentNight.svg?workflow=393960949&branch=main&variant=secondary&v=ci-393960949)](https://github.com/tomasmarekk/agentNight/actions/workflows/ci.yml)
 ![badge](https://repo-badges.46.224.229.218.sslip.io/badge/Win%20%E2%80%A2%20MacOS%20%E2%80%A2%20Linux.svg?variant=secondary&logo=ri%3ABsLaptop&valueColor=ffffff&labelTextColor=ffffff)
@@ -7,8 +7,6 @@
 Leave your AI coding agents running overnight and let the computer turn itself off when they are done.
 
 agentNight sits in the tray, watches your agent sessions and, once the last one has finished, shuts the computer down.
-
-<p align="center"><img src="docs/screenshot.png" alt="agentNight window" width="348"></p>
 
 ## Install
 
