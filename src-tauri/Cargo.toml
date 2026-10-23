@@ -1,0 +1,28 @@
+[package]
+name = "agent-night"
+version = "0.1.0"
+description = "Turns your computer off once your AI coding agents finish their work."
+authors = ["Tomas Marek"]
+license = "MIT"
+repository = "https://github.com/tomasmarekk/agentNight"
+edition = "2021"
+rust-version = "1.82"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "6"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

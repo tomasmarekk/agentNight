@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>agentNight</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="titlebar" data-tauri-drag-region>
+      <div class="brand" data-tauri-drag-region>
+        <svg class="moon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M20.2 14.6A8.6 8.6 0 0 1 9.4 3.8a8.6 8.6 0 1 0 10.8 10.8Z" />
+        </svg>
+        <span data-tauri-drag-region>agentNight</span>
+        <span class="tag" id="dry" hidden>dry run</span>
+      </div>
+      <div class="window-buttons">
+        <button id="hide" class="icon-btn" title="Hide to tray" aria-label="Hide to tray">
+          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 6h7" /></svg>
+        </button>
+        <button id="quit" class="icon-btn danger" title="Quit agentNight" aria-label="Quit">
+          <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6" /></svg>
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <section class="arm" id="arm">
+        <div class="arm-text">
+          <div class="arm-title" id="armTitle">Shut down when done</div>
+          <div class="arm-sub" id="armSub">&nbsp;</div>
+        </div>
+        <button id="switch" class="switch" role="switch" aria-checked="false" aria-labelledby="armTitle">
+          <span class="knob"></span>
+        </button>
+        <button id="cancel" class="cancel" hidden>Cancel</button>
+      </section>
+
+      <div class="list-head">
+        <span>Sessions</span>
+        <span id="count" class="count"></span>
+      </div>
+      <ul id="list" class="list"></ul>
+      <div id="empty" class="empty" hidden>
+        <div class="empty-title">No agent is working</div>
+        <div class="empty-sub">Start a session in Claude Code, Codex, Gemini CLI, opencode, Cursor or another agent and it shows up here.</div>
+      </div>
+    </main>
+
+    <div id="confirm" class="sheet" hidden>
+      <div class="sheet-text">Quitting cancels the scheduled shutdown.</div>
+      <div class="sheet-actions">
+        <button id="keep" class="btn">Keep running</button>
+        <button id="quitAnyway" class="btn primary">Quit</button>
+      </div>
+    </div>
+    <div id="toast" class="toast" hidden></div>
+
+    <script src="icons.js"></script>
+    <script src="main.js"></script>
+  </body>
+</html>
