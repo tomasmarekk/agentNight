@@ -287,13 +287,24 @@ main {
   border-radius: 8px;
   display: grid;
   place-items: center;
-  background: var(--badge-bg);
-  color: var(--badge-fg);
+  overflow: hidden;
+  background: var(--badge-bg, #242428);
+  color: var(--badge-fg, #f4f4f5);
 }
 
 .badge svg {
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
+}
+
+/* App icons that bring their own tile (Codex, Kiro, Gemini CLI, Aider). */
+.badge.tile {
+  background: var(--badge-bg, transparent);
+}
+
+.badge.tile svg {
+  width: 28px;
+  height: 28px;
 }
 
 .badge .mono {
