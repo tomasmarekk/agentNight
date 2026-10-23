@@ -19,6 +19,8 @@ use crate::policy::Phase;
 const WINDOW: &str = "main";
 const WIDTH: f64 = 340.0;
 const HEIGHT: f64 = 460.0;
+/// Matches `--bg` in ui/style.css.
+const BACKGROUND: Color = Color(17, 17, 19, 255);
 
 #[cfg(target_os = "macos")]
 const TRAY_IDLE: &[u8] = include_bytes!("../icons/tray-template.png");
@@ -145,11 +147,15 @@ fn show(app: &AppHandle) {
     let builder = WebviewWindowBuilder::new(app, WINDOW, WebviewUrl::App("index.html".into()))
         .title("agentNight")
         .inner_size(WIDTH, HEIGHT)
-        .resizable(false)
+        // A non-resizable frameless window gets a thin visible frame on Windows; a
+        // resizable one pinned to a single size does not.
+        .min_inner_size(WIDTH, HEIGHT)
+        .max_inner_size(WIDTH, HEIGHT)
         .maximizable(false)
         .decorations(false)
         .shadow(true)
-        .background_color(Color(17, 17, 19, 255))
+        .background_color(BACKGROUND)
+        .theme(Some(tauri::Theme::Dark))
         .focused(true);
     let builder = match position {
         Some(p) => builder.position(p.x, p.y),
@@ -157,6 +163,8 @@ fn show(app: &AppHandle) {
     };
     match builder.build() {
         Ok(window) => {
+            hide_frame_border(&window);
+            let _ = window.set_background_color(Some(BACKGROUND));
             let tx = state.tx.clone();
             let handle = app.clone();
             window.on_window_event(move |event| match event {
@@ -171,6 +179,38 @@ fn show(app: &AppHandle) {
         Err(e) => eprintln!("agentNight: cannot open window: {e}"),
     }
 }
+
+/// Windows 11 outlines frameless windows with a light 1 px border. Turn it off while
+/// keeping the rounded corners and the shadow.
+#[cfg(windows)]
+fn hide_frame_border(window: &tauri::WebviewWindow) {
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: *mut std::ffi::c_void,
+            attribute: u32,
+            value: *const std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    const DWMWA_BORDER_COLOR: u32 = 34;
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+    if let Ok(hwnd) = window.hwnd() {
+        // SAFETY: valid window handle and a 4-byte COLORREF value. Fails harmlessly on
+        // Windows 10, which has no such border.
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd.0,
+                DWMWA_BORDER_COLOR,
+                &DWMWA_COLOR_NONE as *const u32 as *const std::ffi::c_void,
+                4,
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn hide_frame_border(_: &tauri::WebviewWindow) {}
 
 fn hide(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(WINDOW) {
