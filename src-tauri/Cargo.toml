@@ -1,6 +1,6 @@
 [package]
 name = "agent-night"
-version = "0.1.0"
+version = "0.1.1"
 description = "Turns your computer off once your AI coding agents finish their work."
 authors = ["Tomas Marek"]
 license = "MIT"
