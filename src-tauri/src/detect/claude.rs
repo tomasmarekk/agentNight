@@ -2,8 +2,10 @@
 //!
 //! Claude Code keeps a registry of live sessions in `~/.claude/sessions/<pid>.json` with a
 //! `busy` / `idle` / `waiting` status. The transcript in `~/.claude/projects` tells us why a
-//! session stopped (rate limit, connection error). Older versions without the registry
-//! fall back to transcript activity.
+//! session stopped (rate limit, connection error) and whether an `idle` session still has
+//! work in flight: background commands and subagents wake it up again when they finish,
+//! and an unmet `/goal` keeps it going. Older versions without the registry fall back to
+//! transcript activity.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -21,7 +23,20 @@ pub const PROCS: ProcMatch = ProcMatch {
     cmds: &["@anthropic-ai/claude-code", "/claude-code/cli"],
 };
 
-const INITIAL_TAIL: u64 = 2 << 20;
+const INITIAL_TAIL: u64 = 16 << 20;
+/// An unmet `/goal` keeps an idle session counted as working this long.
+const GOAL_IDLE_MS: i64 = 30 * 60_000;
+/// Background tasks older than this are assumed lost rather than still running.
+const TASK_MAX_MS: i64 = 12 * 3_600_000;
+/// Final statuses in a `<task-notification>`.
+const TASK_DONE: &[&str] = &[
+    "completed",
+    "failed",
+    "killed",
+    "stopped",
+    "cancelled",
+    "error",
+];
 
 #[derive(Deserialize)]
 struct Registry {
@@ -56,6 +71,13 @@ struct Msg {
     stop_reason: Option<String>,
 }
 
+/// A background command or subagent that has not reported back yet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Task {
+    started: i64,
+    agent: bool,
+}
+
 #[derive(Default)]
 struct Transcript {
     tail: Tail,
@@ -63,6 +85,10 @@ struct Transcript {
     stop: Option<(Stop, i64)>,
     /// The last turn has not finished yet.
     open_turn: bool,
+    /// Background commands and subagents still running, by task id.
+    tasks: HashMap<String, Task>,
+    /// A `/goal` is set and not met yet.
+    goal: bool,
 }
 
 impl Transcript {
@@ -71,6 +97,8 @@ impl Transcript {
             tail,
             stop,
             open_turn,
+            tasks,
+            goal,
         } = self;
         tail.read(path, len, INITIAL_TAIL, |raw| {
             let Ok(line) = serde_json::from_str::<Line>(raw) else {
@@ -81,6 +109,12 @@ impl Transcript {
                 .as_deref()
                 .and_then(parse_ts)
                 .unwrap_or_else(crate::logs::now_ms);
+            track_tasks(raw, line.kind.as_deref(), at, tasks);
+            if raw.contains("\"type\":\"goal_status\",\"met\":true") {
+                *goal = false;
+            } else if raw.contains("\"type\":\"goal_status\",\"met\":false") {
+                *goal = true;
+            }
             match line.kind.as_deref() {
                 Some("assistant") if line.api_error => {
                     let text = error_text(raw, line.error.as_deref());
@@ -103,6 +137,102 @@ impl Transcript {
             }
         });
     }
+}
+
+/// Work an idle session still has in flight.
+#[derive(Default)]
+struct Work {
+    /// Start of the oldest background task still running.
+    started: Option<i64>,
+    /// Background subagents still running.
+    agents: u32,
+    goal: bool,
+}
+
+impl Transcript {
+    /// Running background tasks started after `since`.
+    fn work(&self, since: i64, now: i64) -> Work {
+        let live = self
+            .tasks
+            .values()
+            .filter(|t| t.started >= since && now - t.started < TASK_MAX_MS);
+        let mut work = Work {
+            goal: self.goal,
+            ..Work::default()
+        };
+        for t in live {
+            work.started = Some(work.started.map_or(t.started, |s| s.min(t.started)));
+            work.agents += t.agent as u32;
+        }
+        work
+    }
+}
+
+/// Background work started and finished in this transcript line. Keys are matched
+/// unescaped, so text quoted inside tool input or output does not count.
+fn track_tasks(raw: &str, kind: Option<&str>, at: i64, tasks: &mut HashMap<String, Task>) {
+    if let Some(id) = string_after(raw, "\"backgroundTaskId\":\"") {
+        tasks.insert(
+            id,
+            Task {
+                started: at,
+                agent: false,
+            },
+        );
+    }
+    if raw.contains("\"status\":\"async_launched\"") {
+        if let Some(id) = string_after(raw, "\"agentId\":\"") {
+            tasks.insert(
+                id,
+                Task {
+                    started: at,
+                    agent: true,
+                },
+            );
+        }
+    }
+    if raw.contains("\"name\":\"TaskStop\"") || raw.contains("Successfully stopped task") {
+        if let Some(id) = string_after(raw, "\"task_id\":\"") {
+            tasks.remove(&id);
+        }
+    }
+    // Notifications count only where Claude Code delivers them: the message queue, a
+    // queued command, or a user message that is the notification itself.
+    let delivered = match kind {
+        Some("queue-operation") => raw.contains("\"content\":\"<task-notification>"),
+        Some("attachment") => {
+            raw.contains("\"type\":\"queued_command\",\"prompt\":\"<task-notification>")
+        }
+        Some("user") => raw.contains("\"role\":\"user\",\"content\":\"<task-notification>"),
+        _ => false,
+    };
+    if !delivered {
+        return;
+    }
+    let mut rest = raw;
+    while let Some(i) = rest.find("<task-notification>") {
+        rest = &rest[i + "<task-notification>".len()..];
+        let block = &rest[..rest.find("</task-notification>").unwrap_or(rest.len())];
+        if let (Some(id), Some(status)) = (tag(block, "task-id"), tag(block, "status")) {
+            if TASK_DONE.contains(&status) {
+                tasks.remove(id);
+            }
+        }
+    }
+}
+
+/// The JSON string value right after `key` (which ends with the opening quote).
+fn string_after(raw: &str, key: &str) -> Option<String> {
+    let start = raw.find(key)? + key.len();
+    let value = &raw[start..start + raw[start..].find('"')?];
+    (!value.is_empty() && value.len() <= 128).then(|| value.to_string())
+}
+
+fn tag<'a>(block: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let start = block.find(&open)? + open.len();
+    let end = start + block[start..].find("</")?;
+    Some(block[start..end].trim())
 }
 
 /// Text of an API error record plus its machine readable error code.
@@ -203,20 +333,32 @@ impl Claude {
                 registered.insert(session_id.clone());
                 let path = self.transcript_path(&root, &reg);
                 let mut stop = None;
+                let mut work = Work::default();
                 if let Some(path) = &path {
                     if let Some(m) = meta(path) {
                         let t = self.transcripts.entry(path.clone()).or_default();
                         t.update(path, m.len);
                         stop = t.stop;
+                        // Tasks from before this process started died with the old one.
+                        work = t.work(reg.started_at.unwrap_or(0) - 60_000, now);
                         live_paths.insert(path.clone());
                     }
                 }
+                let idle_for = now - reg.status_updated_at.unwrap_or(now);
+                let mut since = reg.status_updated_at;
                 let status = match reg.status.as_deref() {
                     Some("busy") => Status::Working,
                     Some("waiting") => Status::Input,
                     _ => match stop {
                         Some((Stop::Limit { until }, at)) => Status::Limit { at, until },
                         Some((Stop::Network, at)) => Status::Interrupted { at },
+                        // The turn ended but background commands or subagents are still
+                        // running; the session wakes up when they finish.
+                        None if work.started.is_some() => {
+                            since = work.started;
+                            Status::Working
+                        }
+                        None if work.goal && idle_for < GOAL_IDLE_MS => Status::Goal,
                         None if cpu.busy(procs, reg.pid) => Status::Working,
                         None => Status::Idle,
                     },
@@ -234,9 +376,9 @@ impl Claude {
                     title,
                     pid: Some(reg.pid),
                     status,
-                    since: reg.status_updated_at,
+                    since,
                     last_active: reg.status_updated_at.unwrap_or(now),
-                    agents: 0,
+                    agents: if work.agents > 0 { work.agents + 1 } else { 0 },
                 });
             }
         }
@@ -304,6 +446,8 @@ impl Claude {
                 Some((Stop::Limit { until }, at)) => Status::Limit { at, until },
                 Some((Stop::Network, at)) => Status::Interrupted { at },
                 None if age < ACTIVE_MS || (t.open_turn && age < OPEN_TURN_MS) => Status::Working,
+                None if t.work(0, now).started.is_some() => Status::Working,
+                None if t.goal && age < GOAL_IDLE_MS => Status::Goal,
                 None => Status::Idle,
             };
             let project = path
@@ -408,6 +552,89 @@ mod tests {
         ]);
         assert!(!t.open_turn);
         assert!(t.stop.is_none());
+    }
+
+    const BG_START: &str = r#"{"type":"user","timestamp":"2026-10-23T14:06:00.000Z","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"Command running in background with ID: b0x0fik1x."}]},"toolUseResult":{"stdout":"","stderr":"","interrupted":false,"backgroundTaskId":"b0x0fik1x"}}"#;
+    const BG_DONE: &str = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-23T14:22:00.000Z","content":"<task-notification>\n<task-id>b0x0fik1x</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<output-file>C:\tmp\b0x0fik1x.output</output-file>\n<status>completed</status>\n<summary>Background command finished</summary>\n</task-notification>"}"#;
+    const END_TURN: &str = r#"{"type":"assistant","timestamp":"2026-10-23T14:06:05.000Z","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Waiting for CI."}]}}"#;
+
+    fn started(t: &Transcript) -> Option<i64> {
+        t.work(0, parse_ts("2026-10-23T15:00:00Z").unwrap()).started
+    }
+
+    /// The turn ends while a background command runs: the session is not done.
+    #[test]
+    fn background_command_keeps_the_session_working() {
+        let t = transcript(&[BG_START, END_TURN]);
+        assert!(!t.open_turn);
+        assert_eq!(started(&t), parse_ts("2026-10-23T14:06:00.000Z"));
+        let t = transcript(&[BG_START, END_TURN, BG_DONE]);
+        assert_eq!(started(&t), None);
+    }
+
+    #[test]
+    fn stopped_and_failed_tasks_are_done() {
+        let stop = r#"{"type":"assistant","timestamp":"2026-10-23T14:07:00.000Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_2","name":"TaskStop","input":{"task_id":"b0x0fik1x"}}]}}"#;
+        assert_eq!(started(&transcript(&[BG_START, stop])), None);
+        let failed = BG_DONE.replace("completed", "failed");
+        assert_eq!(started(&transcript(&[BG_START, &failed])), None);
+    }
+
+    #[test]
+    fn tasks_from_before_the_process_started_are_ignored() {
+        let t = transcript(&[BG_START, END_TURN]);
+        let after = parse_ts("2026-10-23T14:10:00Z").unwrap();
+        assert_eq!(t.work(after, after + 60_000).started, None);
+        // Lost tasks expire.
+        assert_eq!(t.work(0, after + TASK_MAX_MS).started, None);
+    }
+
+    #[test]
+    fn background_subagents_are_counted() {
+        let launch = |id: &str| {
+            format!(
+                r#"{{"type":"user","timestamp":"2026-10-23T14:06:00.000Z","message":{{"role":"user","content":[]}},"toolUseResult":{{"isAsync":true,"status":"async_launched","agentId":"{id}","description":"Research"}}}}"#
+            )
+        };
+        let done = r#"{"type":"queue-operation","operation":"enqueue","timestamp":"2026-10-23T14:20:00.000Z","content":"<task-notification>\n<task-id>a2</task-id>\n<status>completed</status>\n<summary>Agent finished</summary>\n<result>ok</result>\n</task-notification>"}"#;
+        let (a1, a2) = (launch("a1"), launch("a2"));
+        let t = transcript(&[&a1, &a2, END_TURN]);
+        assert_eq!(
+            t.work(0, parse_ts("2026-10-23T14:30:00Z").unwrap()).agents,
+            2
+        );
+        let t = transcript(&[&a1, &a2, END_TURN, done]);
+        assert_eq!(
+            t.work(0, parse_ts("2026-10-23T14:30:00Z").unwrap()).agents,
+            1
+        );
+    }
+
+    /// Tool input and output that merely quote these records are ignored.
+    #[test]
+    fn quoted_records_do_not_count() {
+        let quoted = r#"{"type":"user","timestamp":"2026-10-23T14:06:00.000Z","message":{"role":"user","content":[{"type":"tool_result","content":"{\"backgroundTaskId\":\"bfake\",\"status\":\"async_launched\",\"agentId\":\"afake\"}"}]}}"#;
+        assert_eq!(started(&transcript(&[quoted, END_TURN])), None);
+
+        // A notification typed into a tool call (or echoed in its output) is not real.
+        let typed = r#"{"type":"assistant","timestamp":"2026-10-23T14:07:00.000Z","message":{"role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_3","name":"Bash","input":{"command":"echo '<task-notification>\n<task-id>b0x0fik1x</task-id>\n<status>completed</status>\n</task-notification>'"}}]}}"#;
+        let echoed = r#"{"type":"user","timestamp":"2026-10-23T14:07:01.000Z","message":{"role":"user","content":[{"tool_use_id":"toolu_3","type":"tool_result","content":"<task-notification>\n<task-id>b0x0fik1x</task-id>\n<status>completed</status>\n</task-notification>"}]}}"#;
+        let t = transcript(&[BG_START, typed, echoed, END_TURN]);
+        assert!(started(&t).is_some());
+        // Delivered as a user message, it is real.
+        let delivered = r#"{"type":"user","timestamp":"2026-10-23T14:20:00.000Z","message":{"role":"user","content":"<task-notification>\n<task-id>b0x0fik1x</task-id>\n<status>completed</status>\n</task-notification>"}}"#;
+        assert_eq!(started(&transcript(&[BG_START, END_TURN, delivered])), None);
+    }
+
+    #[test]
+    fn unmet_goal_is_tracked_until_met() {
+        let goal = |met: bool| {
+            format!(
+                r#"{{"type":"attachment","timestamp":"2026-10-23T14:06:00.000Z","attachment":{{"type":"goal_status","met":{met},"condition":"ship it"}}}}"#
+            )
+        };
+        assert!(transcript(&[&goal(false), END_TURN]).goal);
+        assert!(!transcript(&[&goal(false), END_TURN, &goal(true)]).goal);
     }
 
     #[test]

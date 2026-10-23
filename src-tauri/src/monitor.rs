@@ -435,7 +435,8 @@ mod tests {
     }
 
     /// A whole night: the agent works, hits a usage limit, resumes, loses its
-    /// connection, resumes again and finishes. Only the last finish may power off.
+    /// connection, resumes, ends its turn while a background command still runs, and
+    /// finally finishes. Only the last finish may power off.
     /// Needs internet access (shutdown waits for a working connection).
     #[test]
     #[ignore = "end-to-end, takes about a minute and needs internet; CI runs it"]
@@ -496,14 +497,32 @@ mod tests {
         });
         holds(&out, "connection lost", 8);
 
-        // Resumed and finished normally: settle, count down, power off exactly once.
+        // Resumed, then the turn ends while a background command still runs (it wakes
+        // the session up when it finishes): still no shutdown.
         session.resume();
         wait_for(&out, "work to resume", 15, |s| state(s) == Some("working"));
         session.record(json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "tool_result", "content": "Command running in background with ID: bwatch1."}]},
+            "toolUseResult": {"stdout": "", "backgroundTaskId": "bwatch1"},
+        }));
+        session.record(json!({
             "type": "assistant",
-            "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "Done."}]},
+            "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "Waiting for CI."}]},
         }));
         session.status("idle");
+        holds(&out, "background command", 8);
+
+        // The command finishes and nothing else is left: settle, count down, power off
+        // exactly once.
+        session.record(json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": "<task-notification>
+<task-id>bwatch1</task-id>
+<status>completed</status>
+</task-notification>",
+        }));
         wait_for(&out, "the countdown", 30, |s| s.phase == Phase::Countdown);
         assert_eq!(SHUTDOWNS.load(Ordering::SeqCst), 0);
         wait_for(&out, "the shutdown", 15, |s| !s.armed);
