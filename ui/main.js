@@ -73,7 +73,7 @@ function statusText(s, now) {
 function subtitle(s) {
   const parts = [];
   if (s.label !== s.title) parts.push(s.label);
-  if (s.agents > 0) parts.push(plural(s.agents + 1, "agent"));
+  if (s.agents > 1) parts.push(`${s.agents} agents`);
   if (s.pid) parts.push(`PID ${s.pid}`);
   return parts.join(" · ");
 }

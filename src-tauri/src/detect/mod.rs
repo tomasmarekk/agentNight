@@ -35,20 +35,6 @@ pub enum Status {
     Idle,
 }
 
-impl Status {
-    /// Ordering used when merging subagents into their parent row.
-    pub fn rank(&self) -> u8 {
-        match self {
-            Status::Working => 5,
-            Status::Goal => 4,
-            Status::Limit { .. } => 3,
-            Status::Interrupted { .. } => 2,
-            Status::Input => 1,
-            Status::Idle => 0,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Session {
     pub key: String,
@@ -64,7 +50,8 @@ pub struct Session {
     pub since: Option<i64>,
     /// Last observed activity (epoch ms).
     pub last_active: i64,
-    /// Number of subagents folded into this row.
+    /// Agents working in this session right now (main agent plus subagents), shown when
+    /// more than one; 0 otherwise.
     pub agents: u32,
 }
 

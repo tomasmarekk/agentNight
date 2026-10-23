@@ -172,100 +172,119 @@ impl Codex {
             return;
         }
         self.files.refresh(&self.roots);
-        let mut rows: Vec<(Option<String>, Option<String>, Session)> = Vec::new();
+        let mut threads = Vec::new();
         for (path, m) in &self.files.files {
             let r = self.rollouts.entry(path.clone()).or_default();
             r.update(path, m.len);
             let Some(meta) = r.meta.clone() else { continue };
-            let age = now - m.mtime;
-            let status = if age < ACTIVE_MS || (r.open_turn && age < OPEN_TURN_MS) {
-                Status::Working
-            } else if r.goal.as_deref() == Some("usage_limited") {
-                Status::Limit {
-                    at: m.mtime,
-                    until: None,
-                }
-            } else if let Some((stop, at)) = r.stop {
-                match stop {
-                    Stop::Limit { until } => Status::Limit { at, until },
-                    Stop::Network => Status::Interrupted { at },
-                }
-            } else if r.goal.as_deref() == Some("active") && age < GOAL_IDLE_MS {
-                Status::Goal
-            } else {
-                Status::Idle
-            };
-            let since = match status {
-                Status::Working => r.turn_started.filter(|_| r.open_turn),
-                _ => None,
-            };
-            let session = Session {
-                key: format!("codex:{}", meta.id),
-                icon: "codex",
-                label: if meta.app { "Codex App" } else { "Codex CLI" }.into(),
-                title: base_name(&meta.cwd),
-                pid: running.first().copied(),
-                status,
-                since,
-                last_active: m.mtime,
-                agents: 0,
-            };
-            rows.push((Some(meta.id), meta.parent, session));
+            threads.push(Thread {
+                meta,
+                mtime: m.mtime,
+                open_turn: r.open_turn,
+                turn_started: r.turn_started,
+                goal: r.goal.clone(),
+                stop: r.stop,
+            });
         }
         let live: HashSet<&PathBuf> = self.files.files.keys().collect();
         self.rollouts.retain(|p, _| live.contains(p));
-        out.extend(fold_subagents(rows));
+        for tree in group(threads) {
+            out.push(tree_session(&tree, running.first().copied(), now));
+        }
     }
 }
 
-/// Folds subagent threads (at any depth) into their top-level thread's row so one task
-/// shows as one session.
-fn fold_subagents(rows: Vec<(Option<String>, Option<String>, Session)>) -> Vec<Session> {
-    let ids: HashSet<String> = rows.iter().filter_map(|(id, _, _)| id.clone()).collect();
-    let parent_of: HashMap<String, String> = rows
+/// What one rollout (one thread) says as of this scan.
+#[derive(Clone)]
+struct Thread {
+    meta: Meta,
+    mtime: i64,
+    open_turn: bool,
+    turn_started: Option<i64>,
+    goal: Option<String>,
+    stop: Option<(Stop, i64)>,
+}
+
+/// Groups subagent threads (at any depth) under their top-level thread, which comes
+/// first in each group.
+fn group(threads: Vec<Thread>) -> Vec<Vec<Thread>> {
+    let ids: HashSet<String> = threads.iter().map(|t| t.meta.id.clone()).collect();
+    let parent_of: HashMap<String, String> = threads
         .iter()
-        .filter_map(|(id, parent, _)| Some((id.clone()?, parent.clone()?)))
+        .filter_map(|t| Some((t.meta.id.clone(), t.meta.parent.clone()?)))
         .collect();
     let top = |id: &str| {
         let mut cur = id.to_string();
         for _ in 0..16 {
             match parent_of.get(&cur) {
-                Some(p) if ids.contains(p) => cur = p.clone(),
+                Some(p) if ids.contains(p) && *p != cur => cur = p.clone(),
                 _ => break,
             }
         }
         cur
     };
-    let mut tops: HashMap<String, Session> = HashMap::new();
-    let mut children = Vec::new();
-    let mut standalone = Vec::new();
-    for (id, _, s) in rows {
-        match id {
-            Some(id) => {
-                let t = top(&id);
-                if t == id {
-                    tops.insert(id, s);
-                } else {
-                    children.push((t, s));
-                }
-            }
-            None => standalone.push(s),
+    let mut groups: HashMap<String, Vec<Thread>> = HashMap::new();
+    for t in threads {
+        let root = top(&t.meta.id);
+        let group = groups.entry(root.clone()).or_default();
+        if t.meta.id == root {
+            group.insert(0, t);
+        } else {
+            group.push(t);
         }
     }
-    for (t, child) in children {
-        let Some(p) = tops.get_mut(&t) else {
-            standalone.push(child);
-            continue;
-        };
-        p.agents += 1;
-        p.last_active = p.last_active.max(child.last_active);
-        if child.status.rank() > p.status.rank() {
-            p.status = child.status;
-            p.since = child.since;
+    groups.into_values().collect()
+}
+
+/// One row per task: the top-level thread plus its subagents, judged together. A main
+/// agent waiting for its subagents writes nothing for hours, so an open turn counts as
+/// long as anything in the tree was active recently.
+fn tree_session(tree: &[Thread], pid: Option<u32>, now: i64) -> Session {
+    let root = &tree[0];
+    let last_active = tree.iter().map(|t| t.mtime).max().unwrap_or(root.mtime);
+    let quiet = now - last_active;
+    let active = |t: &Thread, is_root: bool| {
+        let open_for = if is_root { quiet } else { now - t.mtime };
+        now - t.mtime < ACTIVE_MS || (t.open_turn && open_for < OPEN_TURN_MS)
+    };
+    let agents = tree
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| active(t, *i == 0))
+        .count() as u32;
+    let status = if agents > 0 {
+        Status::Working
+    } else if root.goal.as_deref() == Some("usage_limited") {
+        Status::Limit {
+            at: last_active,
+            until: None,
         }
+    } else if let Some((stop, at)) = root.stop {
+        match stop {
+            Stop::Limit { until } => Status::Limit { at, until },
+            Stop::Network => Status::Interrupted { at },
+        }
+    } else if root.goal.as_deref() == Some("active") && quiet < GOAL_IDLE_MS {
+        Status::Goal
+    } else {
+        Status::Idle
+    };
+    Session {
+        key: format!("codex:{}", root.meta.id),
+        icon: "codex",
+        label: if root.meta.app {
+            "Codex App"
+        } else {
+            "Codex CLI"
+        }
+        .into(),
+        title: base_name(&root.meta.cwd),
+        pid,
+        since: root.turn_started.filter(|_| root.open_turn && agents > 0),
+        status,
+        last_active,
+        agents: if agents > 1 { agents } else { 0 },
     }
-    standalone.extend(tops.into_values());
-    standalone
 }
 
 #[cfg(test)]
@@ -320,43 +339,104 @@ mod tests {
         assert!(matches!(r.stop, Some((Stop::Limit { until: Some(_) }, _))));
     }
 
-    fn row(key: &str, status: Status) -> Session {
-        Session {
-            key: key.into(),
-            icon: "codex",
-            label: "Codex App".into(),
-            title: "p".into(),
-            pid: None,
-            status,
-            since: None,
-            last_active: 0,
-            agents: 0,
+    const MIN: i64 = 60_000;
+    const NOW: i64 = 1_000 * 60 * MIN;
+
+    /// A thread whose log was last written `ago` ms before `NOW`.
+    fn thread(id: &str, parent: Option<&str>, ago: i64, open_turn: bool) -> Thread {
+        Thread {
+            meta: Meta {
+                id: id.into(),
+                parent: parent.map(Into::into),
+                cwd: "C:\\work\\rootlight".into(),
+                app: true,
+            },
+            mtime: NOW - ago,
+            open_turn,
+            turn_started: Some(NOW - 8 * 60 * MIN),
+            goal: None,
+            stop: None,
         }
     }
 
-    #[test]
-    fn subagents_fold_into_parent() {
-        let rows = vec![
-            (Some("p".into()), None, row("p", Status::Idle)),
-            (
-                Some("c1".into()),
-                Some("p".into()),
-                row("c1", Status::Working),
-            ),
-            (Some("c2".into()), Some("p".into()), row("c2", Status::Idle)),
-            (Some("g".into()), Some("c2".into()), row("g", Status::Idle)),
-            (
-                Some("x".into()),
-                Some("missing".into()),
-                row("x", Status::Idle),
-            ),
-        ];
-        let mut out = fold_subagents(rows);
+    fn sessions(threads: Vec<Thread>) -> Vec<Session> {
+        let mut out: Vec<Session> = group(threads)
+            .iter()
+            .map(|tree| tree_session(tree, None, NOW))
+            .collect();
         out.sort_by(|a, b| a.key.cmp(&b.key));
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].key, "p");
-        assert_eq!(out[0].agents, 3);
+        out
+    }
+
+    /// The real case: a main agent waiting on its subagents for hours (its own log is
+    /// old), three subagents working, many finished earlier.
+    #[test]
+    fn counts_only_agents_working_now() {
+        let mut threads = vec![
+            thread("main", None, 472 * MIN, true),
+            thread("w1", Some("main"), MIN / 5, true),
+            thread("w2", Some("main"), MIN / 2, true),
+            thread("w3", Some("main"), 2 * MIN, true),
+            thread("done-recently", Some("main"), 2 * MIN, false),
+        ];
+        for i in 0..14 {
+            threads.push(thread(
+                &format!("old{i}"),
+                Some("main"),
+                (60 + i * 30) * MIN,
+                false,
+            ));
+        }
+        let out = sessions(threads);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].key, "codex:main");
         assert_eq!(out[0].status, Status::Working);
-        assert_eq!(out[1].key, "x");
+        assert_eq!(out[0].agents, 4);
+        assert_eq!(out[0].title, "rootlight");
+    }
+
+    #[test]
+    fn main_agent_waiting_on_a_long_subagent_command_still_works() {
+        let out = sessions(vec![
+            thread("main", None, 300 * MIN, true),
+            thread("w1", Some("main"), 40 * MIN, true),
+        ]);
+        assert_eq!(out[0].status, Status::Working);
+        assert_eq!(out[0].agents, 2);
+    }
+
+    #[test]
+    fn abandoned_open_turns_do_not_count() {
+        let out = sessions(vec![
+            thread("main", None, 5 * 60 * MIN, true),
+            thread("w1", Some("main"), 4 * 60 * MIN, true),
+        ]);
+        assert_eq!(out[0].status, Status::Idle);
+        assert_eq!(out[0].agents, 0);
+    }
+
+    #[test]
+    fn single_agent_shows_no_count_and_nested_subagents_fold() {
+        let out = sessions(vec![
+            thread("main", None, MIN / 2, true),
+            thread("child", Some("main"), 30 * MIN, false),
+            thread("grandchild", Some("child"), 3 * MIN, false),
+            thread("orphan", Some("missing"), 10 * MIN, false),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].key, "codex:main");
+        assert_eq!(out[0].status, Status::Working);
+        assert_eq!(out[0].agents, 0);
+        assert_eq!(out[1].key, "codex:orphan");
+        assert_eq!(out[1].status, Status::Idle);
+    }
+
+    #[test]
+    fn active_goal_holds_after_the_turn_ends() {
+        let mut main = thread("main", None, 10 * MIN, false);
+        main.goal = Some("active".into());
+        assert_eq!(sessions(vec![main.clone()])[0].status, Status::Goal);
+        main.mtime = NOW - 45 * MIN;
+        assert_eq!(sessions(vec![main])[0].status, Status::Idle);
     }
 }

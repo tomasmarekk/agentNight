@@ -52,7 +52,8 @@ agentNight would rather leave the computer on than cut work short.
 
 - **Usage limits.** A session stopped by a rate limit or the 5-hour window keeps the computer on until the announced reset plus 20 minutes (at most 6 hours), because several harnesses continue on their own once the limit lifts.
 - **Network trouble.** A session that stopped on a connection error after you armed the switch keeps the computer on, so you can resume it in the morning. While the internet is down nothing shuts down at all, and after it comes back agentNight waits another 3 minutes so reconnecting agents can resume.
-- **Goals and pauses between turns.** `/goal` loops, stop hooks and background tasks often go quiet for a moment between turns. The 5-minute grace period covers that, and an active Codex goal counts as work for 30 minutes after its last activity.
+- **Background work.** A Claude Code session whose turn ended while background commands or subagents are still running counts as working until they report back, because the agent continues once they do. In Codex, a main agent waiting for its subagents counts as working too.
+- **Goals and pauses between turns.** An unmet `/goal` (Claude Code or Codex) counts as work for 30 minutes after the last activity, and the 5-minute grace period covers short pauses between turns and stop hooks.
 - **Agents waiting for you.** A session waiting for a permission prompt does not hold the computer on, because it will not continue until you answer.
 
 ## Troubleshooting
