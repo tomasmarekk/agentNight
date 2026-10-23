@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Run manually to also build the installers (uploaded as workflow artifacts, no release).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -48,3 +50,56 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+  bundle:
+    name: installers (${{ matrix.name }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            args: ""
+          - name: macOS
+            os: macos-latest
+            args: --target universal-apple-darwin
+          - name: Linux
+            os: ubuntu-24.04
+            args: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf rpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build installers
+        working-directory: src-tauri
+        shell: bash
+        run: npx --yes @tauri-apps/cli@2 build ${{ matrix.args }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installers-${{ matrix.name }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            src-tauri/target/**/bundle/msi/*.msi
+            src-tauri/target/**/bundle/nsis/*.exe
+            src-tauri/target/**/bundle/dmg/*.dmg
+            src-tauri/target/**/bundle/appimage/*.AppImage
+            src-tauri/target/**/bundle/deb/*.deb
+            src-tauri/target/**/bundle/rpm/*.rpm
