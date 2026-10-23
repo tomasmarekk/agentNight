@@ -52,6 +52,11 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # End-to-end night (real detection, network check and policy) and the shutdown
+      # command sequence with stand-in system commands.
+      - name: End-to-end tests
+        run: cargo test --locked -- --ignored --test-threads=1
+
   bundle:
     name: installers (${{ matrix.name }})
     if: github.event_name == 'workflow_dispatch'

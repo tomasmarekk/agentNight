@@ -143,3 +143,62 @@ impl Drop for KeepAwake {
         self.set(false);
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Runs the real shutdown sequence against stand-in system commands that only
+    /// record how they were called (and fail or succeed as configured).
+    #[test]
+    #[ignore = "replaces system commands through PATH; CI runs it"]
+    fn shutdown_runs_the_system_command() {
+        let dir = crate::logs::tests::tmp("power-stubs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("calls.log");
+        let stubs: &[(&str, i32)] = if cfg!(target_os = "macos") {
+            &[("osascript", 0)]
+        } else {
+            &[("systemctl", 1), ("loginctl", 0), ("shutdown", 0)]
+        };
+        for (name, code) in stubs {
+            let path = dir.join(name);
+            let script = format!(
+                "#!/bin/sh\necho \"{name} $*\" >> '{}'\nexit {code}\n",
+                log.display()
+            );
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let original = std::env::var_os("PATH").unwrap_or_default();
+        std::env::set_var("PATH", &dir);
+
+        // Make sure the stubs are what gets resolved before calling the real function.
+        let probe = Command::new(stubs[0].0).arg("probe").status();
+        let probed = std::fs::read_to_string(&log).unwrap_or_default();
+        let result = if probed.contains("probe") {
+            std::fs::remove_file(&log).unwrap();
+            Some(shutdown())
+        } else {
+            None
+        };
+        std::env::set_var("PATH", original);
+        assert!(
+            probe.is_ok() && result.is_some(),
+            "stubs were not used: {probed:?}"
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(result.unwrap(), Ok(()));
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                calls,
+                "osascript -e tell application \"System Events\" to shut down\n"
+            );
+        } else {
+            assert_eq!(calls, "systemctl poweroff\nloginctl poweroff\n");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

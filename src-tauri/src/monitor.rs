@@ -102,10 +102,15 @@ pub struct Monitor {
     rows: Vec<Row>,
     notice: Option<(String, Instant)>,
     deadline: Option<(Phase, i64)>,
+    shutdown: fn() -> Result<(), String>,
 }
 
 impl Monitor {
     pub fn new(cfg: Config) -> Self {
+        Self::with_shutdown(cfg, power::shutdown)
+    }
+
+    fn with_shutdown(cfg: Config, shutdown: fn() -> Result<(), String>) -> Self {
         Monitor {
             policy: Policy::new(&cfg),
             cfg,
@@ -119,6 +124,7 @@ impl Monitor {
             rows: Vec::new(),
             notice: None,
             deadline: None,
+            shutdown,
         }
     }
 
@@ -298,9 +304,215 @@ impl Monitor {
             self.notify("Dry run: the computer would shut down now");
             return;
         }
-        if let Err(e) = power::shutdown() {
+        if let Err(e) = (self.shutdown)() {
             eprintln!("agentNight: shutdown failed: {e}");
             self.notify(&format!("Shutdown failed: {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, Receiver};
+
+    use serde_json::{json, Value};
+
+    static SHUTDOWNS: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_shutdown() -> Result<(), String> {
+        SHUTDOWNS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Body of the stand-in agent process started by `fake_agent`.
+    #[test]
+    #[ignore = "helper process for end_to_end_night"]
+    fn fake_agent_body() {
+        if std::env::var_os("AGENTNIGHT_FAKE_AGENT").is_some() {
+            std::thread::sleep(Duration::from_secs(300));
+        }
+    }
+
+    /// Runs this test binary again as a process named `claude`, so detection, PID and
+    /// start-time checks see what they would see for a real Claude Code process.
+    fn fake_agent(dir: &Path) -> Child {
+        let exe = dir.join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        });
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+        Command::new(&exe)
+            .args(["--ignored", "--exact", "monitor::tests::fake_agent_body"])
+            .env("AGENTNIGHT_FAKE_AGENT", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    /// The session files Claude Code would write for the stand-in agent.
+    struct Session {
+        home: PathBuf,
+        pid: u32,
+        started: i64,
+    }
+
+    impl Session {
+        fn status(&self, status: &str) {
+            let dir = self.home.join(".claude").join("sessions");
+            std::fs::create_dir_all(&dir).unwrap();
+            let registry = json!({
+                "pid": self.pid, "sessionId": "e2e", "cwd": self.home.join("demo"),
+                "startedAt": self.started, "status": status, "statusUpdatedAt": now_ms(),
+                "name": "Overnight refactor", "entrypoint": "cli",
+            });
+            std::fs::write(dir.join(format!("{}.json", self.pid)), registry.to_string()).unwrap();
+        }
+
+        fn record(&self, mut record: Value) {
+            record["timestamp"] = json!(chrono::Utc::now().to_rfc3339());
+            let dir = self.home.join(".claude").join("projects").join("demo");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("e2e.jsonl"))
+                .unwrap();
+            writeln!(file, "{record}").unwrap();
+        }
+
+        fn api_error(&self, code: &str, text: &str) {
+            self.record(json!({
+                "type": "assistant", "isApiErrorMessage": true, "error": code,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+            }));
+        }
+
+        fn resume(&self) {
+            self.record(
+                json!({"type": "user", "message": {"role": "user", "content": "continue"}}),
+            );
+            self.status("busy");
+        }
+    }
+
+    fn state(s: &Snapshot) -> Option<&'static str> {
+        s.sessions
+            .iter()
+            .find(|r| r.key.starts_with("claude:e2e:"))
+            .map(|r| r.state)
+    }
+
+    fn wait_for(out: &Receiver<Snapshot>, what: &str, secs: u64, ok: impl Fn(&Snapshot) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut last = None;
+        while Instant::now() < deadline {
+            if let Ok(s) = out.recv_timeout(Duration::from_millis(200)) {
+                if ok(&s) {
+                    return;
+                }
+                last = Some(s);
+            }
+        }
+        panic!("timed out waiting for {what}; last snapshot: {last:#?}");
+    }
+
+    /// Every snapshot for `secs` seconds keeps the shutdown armed and waiting.
+    fn holds(out: &Receiver<Snapshot>, what: &str, secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if let Ok(s) = out.recv_timeout(Duration::from_millis(200)) {
+                assert!(s.armed && s.phase == Phase::Watching, "{what}: {s:#?}");
+            }
+        }
+        assert_eq!(SHUTDOWNS.load(Ordering::SeqCst), 0, "{what}: shut down");
+    }
+
+    /// A whole night: the agent works, hits a usage limit, resumes, loses its
+    /// connection, resumes again and finishes. Only the last finish may power off.
+    /// Needs internet access (shutdown waits for a working connection).
+    #[test]
+    #[ignore = "end-to-end, takes about a minute and needs internet; CI runs it"]
+    fn end_to_end_night() {
+        let home = crate::logs::tests::tmp("e2e-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("AGENTNIGHT_HOME", &home);
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::remove_var("CODEX_HOME");
+
+        let mut agent = fake_agent(&home);
+        let session = Session {
+            home: home.clone(),
+            pid: agent.id(),
+            started: now_ms(),
+        };
+        session.status("busy");
+
+        let cfg = Config {
+            grace: Duration::from_secs(2),
+            online_grace: Duration::from_secs(1),
+            countdown: Duration::from_secs(2),
+            dry_run: false,
+        };
+        let (tx, rx) = mpsc::channel();
+        let (out_tx, out) = mpsc::channel();
+        let monitor = std::thread::spawn(move || {
+            Monitor::with_shutdown(cfg, record_shutdown).run(rx, |s| {
+                let _ = out_tx.send(s.clone());
+            })
+        });
+        tx.send(Cmd::Visible(true)).unwrap();
+
+        wait_for(&out, "the working session", 20, |s| {
+            s.can_arm && state(s) == Some("working")
+        });
+        tx.send(Cmd::Arm(true)).unwrap();
+        wait_for(&out, "arming", 10, |s| {
+            s.armed && s.phase == Phase::Watching
+        });
+
+        // Usage limit: the agent stops, the computer must stay on.
+        session.api_error(
+            "rate_limit",
+            "You've hit your session limit · resets 11:59pm",
+        );
+        session.status("idle");
+        wait_for(&out, "the limit hold", 15, |s| state(s) == Some("limit"));
+        holds(&out, "usage limit", 8);
+
+        // Resumed, then the connection drops: still no shutdown.
+        session.resume();
+        wait_for(&out, "work to resume", 15, |s| state(s) == Some("working"));
+        session.api_error("unknown", "API Error: Connection error.");
+        session.status("idle");
+        wait_for(&out, "the connection hold", 15, |s| {
+            state(s) == Some("offline")
+        });
+        holds(&out, "connection lost", 8);
+
+        // Resumed and finished normally: settle, count down, power off exactly once.
+        session.resume();
+        wait_for(&out, "work to resume", 15, |s| state(s) == Some("working"));
+        session.record(json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "Done."}]},
+        }));
+        session.status("idle");
+        wait_for(&out, "the countdown", 30, |s| s.phase == Phase::Countdown);
+        assert_eq!(SHUTDOWNS.load(Ordering::SeqCst), 0);
+        wait_for(&out, "the shutdown", 15, |s| !s.armed);
+        assert_eq!(SHUTDOWNS.load(Ordering::SeqCst), 1);
+
+        drop(tx);
+        monitor.join().unwrap();
+        let _ = agent.kill();
+        let _ = agent.wait();
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
