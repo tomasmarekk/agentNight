@@ -31,10 +31,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::error::Release $TAG already exists. Bump the version in src-tauri/tauri.conf.json first."
-            exit 1
-          fi
+          # A published release with this tag stops the run; drafts left by failed runs are replaced.
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq '.[] | select(.tag_name == env.TAG) | "\(.id) \(.draft)"' > existing.txt
+          while read -r id draft; do
+            if [ "$draft" = "true" ]; then
+              echo "Removing unfinished draft $id from an earlier run"
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+            else
+              echo "::error::Release $TAG already exists. Bump the version in src-tauri/tauri.conf.json first."
+              exit 1
+            fi
+          done < existing.txt
           cat > notes.md <<'EOF'
           Turns your computer off once your AI coding agents finish their work.
 
@@ -46,8 +54,14 @@ jobs:
 
           The builds are not code-signed yet, see the README for the first-launch steps.
           EOF
-          gh release create "$TAG" --draft --title "agentNight $TAG" --notes-file notes.md --target "$GITHUB_SHA"
-          echo "id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --jq ".[] | select(.tag_name == \"$TAG\") | .id")" >> "$GITHUB_OUTPUT"
+          id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" -f name="agentNight $TAG" \
+            -F draft=true -F body=@notes.md --jq .id)
+          if [ -z "$id" ]; then
+            echo "::error::Could not create the draft release"
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
 
   build:
     needs: create-release
@@ -83,6 +97,10 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - name: Check release id
+        shell: bash
+        run: test -n "${{ needs.create-release.outputs.release_id }}"
+
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -98,4 +116,14 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "${{ needs.create-release.outputs.tag }}" --draft=false --repo "$GITHUB_REPOSITORY"
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        run: |
+          assets=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '[.assets[].name] | join("\n")')
+          echo "$assets"
+          for pattern in '_x64-setup\.exe$' '\.msi$' '\.dmg$' '\.AppImage$' '\.deb$' '\.rpm$'; do
+            if ! grep -qE "$pattern" <<< "$assets"; then
+              echo "::error::No installer matching $pattern was uploaded; leaving the release as a draft."
+              exit 1
+            fi
+          done
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false --jq .html_url
