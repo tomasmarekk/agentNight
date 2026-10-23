@@ -1,0 +1,131 @@
+name: Smoke test
+
+# Runs the release build through a whole night on real (virtual) machines: a stand-in
+# agent works, the switch is clicked, the agent finishes. On Windows agentNight then
+# really powers the runner off; on Linux and macOS it runs in dry-run mode.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+
+jobs:
+  windows:
+    name: "Windows: real power-off"
+    runs-on: windows-latest
+    # The runner disappears mid-job when the power-off works.
+    continue-on-error: true
+    # A powered-off runner never reports back, so the job ends at this timeout.
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build
+        working-directory: src-tauri
+        run: cargo build --release --locked
+
+      - name: Start a stand-in agent and agentNight
+        run: ./.github/smoke/night.ps1 start
+
+      - name: Turn on Shut down when done
+        run: ./.github/smoke/night.ps1 arm
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: screenshots-windows
+          path: ${{ runner.temp }}/screenshots
+
+      - name: Let the agent finish (agentNight powers this machine off)
+        run: ./.github/smoke/night.ps1 finish
+
+      - name: Not reached if the machine powered off
+        run: exit 1
+
+  verify-power-off:
+    name: "Windows: machine went down"
+    needs: windows
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check the Windows job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs")
+          job=$(jq '.jobs[] | select(.name == "Windows: real power-off")' <<< "$jobs")
+          jq '{conclusion, completed_at, steps: [.steps[] | {name, status, conclusion, started_at}]}' <<< "$job"
+          field() { jq -r --arg n "$1" --arg f "$2" '.steps[] | select(.name == $n) | .[$f]' <<< "$job"; }
+          finish='Let the agent finish (agentNight powers this machine off)'
+
+          # The switch was turned on while the agent worked.
+          test "$(field 'Turn on Shut down when done' conclusion)" = success
+          # The step that waits five minutes after the agent finishes never ended, and
+          # nothing ran after it: the machine went away during the wait.
+          test "$(field "$finish" status)" != completed
+          test "$(field 'Not reached if the machine powered off' started_at)" = null
+          silent=$(( $(date -d "$(jq -r .completed_at <<< "$job")" +%s) - $(date -d "$(field "$finish" started_at)" +%s) ))
+          echo "The runner stayed silent for $silent s after the agent finished."
+          test "$silent" -gt 330
+          echo "agentNight was armed, the agent finished and the Windows runner powered off."
+
+  unix:
+    name: "${{ matrix.name }}: dry-run night"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-24.04
+          - name: macOS
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
+            xvfb xdotool imagemagick stalonetray dbus-x11
+          # WebKitGTK sandboxes its web process with user namespaces.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build
+        working-directory: src-tauri
+        run: cargo build --release --locked
+
+      - name: Run a night
+        env:
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            dbus-run-session -- .github/smoke/night.sh
+          else
+            .github/smoke/night.sh
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: screenshots-${{ matrix.name }}
+          path: ${{ runner.temp }}/screenshots
